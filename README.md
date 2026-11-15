@@ -20,3 +20,7 @@ JavaScript syntax and mocked core tests passed: short-story full context, input 
 
 ### GitHub Pages quick preview
 In repository Settings → Pages, select Deploy from a branch, main / (root), then Save. GitHub Pages serves the frontend only; select Direct to NanoGPT. For the same-origin proxy, connect this repository to Cloudflare Pages instead.
+
+
+### Connection test and billing safety
+Use Settings → Test API for a small real completion (up to 64 generated tokens; may consume quota or balance). Writing and memory now default to the subscription-only API; choose All models explicitly for premium models. The API key is session-memory only. GitHub Pages is direct mode only; Cloudflare Pages can use the included proxy. The browser must permit cross-origin access for direct mode. No automatic retry or paid fallback is performed.
