@@ -268,8 +268,8 @@ function rank(items,query){const q=[...new Set(words(query))].slice(0,180);if(!q
 function activeComplete(s){return s.messages.filter(m=>m.active!==false&&m.status!=='partial')}
 function eligibleMemory(s,all=activeComplete(s)){const ids=new Set(all.map(m=>m.id));return s.memory.filter(n=>(!n.sources?.length||n.sources.every(id=>ids.has(id)))&&(!n.sceneId||ids.has(n.sceneId)))}
 function sceneOrder(all){return new Map(all.filter(m=>m.role==='assistant').map((m,i)=>[m.id,i+1]))}
-function timelineEntries(notes,all){const order=sceneOrder(all);return notes.filter(n=>n.kind==='event'&&order.has(n.sceneId)).sort((a,b)=>order.get(a.sceneId)-order.get(b.sceneId))}
-function latestSituation(notes,all){const order=sceneOrder(all);return notes.filter(n=>n.kind==='situation'&&order.has(n.sceneId)).sort((a,b)=>order.get(b.sceneId)-order.get(a.sceneId))[0]}
+function timelineEntries(notes,all){const order=sceneOrder(all),events=notes.filter(n=>n.kind==='event'&&order.has(n.sceneId)),edited=new Set(events.filter(n=>n.authorEdited||n.pinned).map(n=>n.sceneId));return events.filter(n=>!edited.has(n.sceneId)||n.authorEdited||n.pinned).sort((a,b)=>order.get(a.sceneId)-order.get(b.sceneId))}
+function latestSituation(notes,all){const order=sceneOrder(all);return notes.filter(n=>n.kind==='situation'&&order.has(n.sceneId)).sort((a,b)=>order.get(b.sceneId)-order.get(a.sceneId)||Number(!!(b.authorEdited||b.pinned))-Number(!!(a.authorEdited||a.pinned)))[0]}
 function memoryPreserved(n){return n.pinned||n.authorEdited||!n.sources?.length}
 function noteKey(n){return [n.kind||'reference',n.sceneId||'',String(n.text).trim().toLowerCase(),...(n.sources||[]).slice().sort()].join('|')}
 function mergeMemory(target,entries){const keys=new Set(target.map(noteKey));for(const x of entries){if(keys.has(noteKey(x)))continue;target.push({id:uid(),...x,pinned:false,created:now()});keys.add(noteKey(x))}return target}
@@ -299,7 +299,7 @@ function context(s,prompt='',override,limitOverride){
  }
  const recentIds=new Set(recent.map(m=>m.id)),older=all.filter(m=>!recentIds.has(m.id)),olderScenes=older.filter(m=>m.role==='assistant'),olderIds=new Set(older.map(m=>m.id));
  if(s.mode!=='full'&&!shortFull){
-  const events=timelineEntries(usableMemory,all).filter(n=>olderIds.has(n.sceneId)),eventScenes=new Set(events.map(n=>n.sceneId));
+  const allEvents=timelineEntries(usableMemory,all).filter(n=>olderIds.has(n.sceneId)),eventScenes=new Set(allEvents.map(n=>n.sceneId)),events=allEvents.filter(n=>!n.pinned);
   timelineTotal=events.length;missingEvents=olderScenes.filter(m=>!eventScenes.has(m.id)).length;
   const fmtEvent=n=>'Scene '+order.get(n.sceneId)+': '+n.text;
   const chosen=timelineSelection(events,Math.min(4000,Math.floor(Math.max(0,cap-used)*.70)),fmtEvent);
