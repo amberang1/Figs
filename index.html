@@ -256,7 +256,7 @@ dialog h3{font-size:15px;font-weight:650;margin:12px 0 6px}
 'use strict';
 const $=id=>document.getElementById(id), uid=()=>globalThis.crypto?.randomUUID?.()||Date.now().toString(36)+Math.random().toString(36).slice(2), now=()=>new Date().toISOString();
 const BASE='https://api.nano-gpt.com/api';const defaults={model:'z-ai/glm-5.3',maxOutput:16384,modelLimit:262144,memoryModel:'',autoMemory:true,memoryThreshold:25000,memoryLimit:65536,globalBible:'',transport:'direct',favoriteModels:[],modelProfiles:{},writingBilling:'subscription',memoryBilling:'subscription',readingFont:'sans',readingSize:18,readingSpacing:'comfortable'};
-const newStory=(title='Untitled story')=>({id:uid(),title,bible:'',mode:'smart',view:'story',model:'',favorite:false,budget:40000,recentBudget:22000,messages:[],memory:[],indexed:[],created:now(),updated:now()});
+const newStory=(title='Untitled story')=>({id:uid(),title,bible:'',mode:'smart',view:'story',model:'',favorite:false,budget:40000,recentBudget:22000,messages:[],memory:[],indexed:[],deletedTimeline:[],created:now(),updated:now()});
 let state={stories:[],active:null,settings:{...defaults}}, db, apiKey='', busy=false, controller=null, displayCount=25, editingMemory=null, archiveMode='messages', pendingSave=Promise.resolve(), memoryJobs=new Map(), memoryErrors=new Map();
 function writingModel(s=active()){return s?.model||state.settings.model}function tokens(s){return Math.ceil(String(s||'').length/3.4)}function fmt(n){return n>=1000?(n/1000).toFixed(n>=10000?0:1)+'K':String(n)}function active(){return state.stories.find(s=>s.id===state.active)}function msg(role,content,extra={}){return {id:uid(),role,content,created:now(),active:true,...extra}}function status(t='',err=false){$('status').textContent=t;$('status').classList.toggle('error',err)}
 // Keep a single serialized save queue, but reconnect when the browser closes
@@ -366,23 +366,25 @@ function normalizeTimelineNote(n,all){
  const sceneId=n.sceneId&&assistants.has(n.sceneId)?n.sceneId:options.length===1?options[0]:null;
  return sceneId?{...n,kind:'event',sceneId}:n;
 }
+function deletedTimelineScenes(s){return new Set((s.deletedTimeline||[]).map(x=>x.sceneId).filter(Boolean))}
+function isTimelineForScene(n,id,all){const normalized=normalizeTimelineNote(n,all);return normalized.kind==='event'&&normalized.sceneId===id}
 function eligibleMemory(s,all=activeComplete(s)){
  const ids=new Set(all.map(m=>m.id));
  return (s.memory||[]).filter(n=>(!n.sources?.length||n.sources.every(id=>ids.has(id)))&&(!n.sceneId||ids.has(n.sceneId))).map(n=>normalizeTimelineNote(n,all));
 }
 function usableStoryMemory(s,all=activeComplete(s)){
- const stored=eligibleMemory(s,all),cp=s.memoryRebuild?.entries||[],
- drafts=eligibleMemory({memory:cp},all).map(n=>({...n,fromCheckpoint:true}));
+ const suppressed=deletedTimelineScenes(s),stored=eligibleMemory(s,all).filter(n=>!(n.kind==='event'&&suppressed.has(n.sceneId))),cp=s.memoryRebuild?.entries||[],
+ drafts=eligibleMemory({memory:cp},all).filter(n=>!(n.kind==='event'&&suppressed.has(n.sceneId))).map(n=>({...n,fromCheckpoint:true}));
  return [...stored,...drafts];
 }
 function memoryDiagnostics(s,all=activeComplete(s)){
- const main=(s.memory||[]).filter(n=>n.kind==='event'||n.type==='Timeline'),
+ const suppressed=deletedTimelineScenes(s),main=(s.memory||[]).filter(n=>n.kind==='event'||n.type==='Timeline'),
  staged=s.memoryRebuild?.entries||[],activeIds=new Set(all.map(m=>m.id)),
- activeMain=timelineEntries(eligibleMemory(s,all),all),activeDraft=timelineEntries(eligibleMemory({memory:staged},all),all),
+ activeMain=timelineEntries(eligibleMemory(s,all).filter(n=>!suppressed.has(n.sceneId)),all),activeDraft=timelineEntries(eligibleMemory({memory:staged},all).filter(n=>!suppressed.has(n.sceneId)),all),
  archived=main.filter(n=>(n.sources||[]).some(id=>!activeIds.has(id))||(n.sceneId&&!activeIds.has(n.sceneId))).length,
  unmapped=main.filter(n=>!activeMain.some(e=>e.id===n.id)&&!(n.sources||[]).some(id=>!activeIds.has(id))&&(!n.sceneId||activeIds.has(n.sceneId))).length;
  const total=timelineEntries(usableStoryMemory(s,all),all).length;
- return {total,stored:activeMain.length,staged:activeDraft.length,archived,unmapped,raw:main.length,checkpoint:!!s.memoryRebuild,checkpointProgress:s.memoryRebuild?.completedIds?.length||0};
+ return {total,stored:activeMain.length,staged:activeDraft.length,archived,unmapped,raw:main.length,deleted:suppressed.size,checkpoint:!!s.memoryRebuild,checkpointProgress:s.memoryRebuild?.completedIds?.length||0};
 }
 function sceneOrder(all){return new Map(all.filter(m=>m.role==='assistant').map((m,i)=>[m.id,i+1]))}
 function timelineEntries(notes,all){
@@ -412,7 +414,7 @@ function context(s,prompt='',override,limitOverride){
  all=override||activeComplete(s),
  cap=Math.max(0,Math.min(Number(s.budget),Number(set.modelLimit)-Number(set.maxOutput)-512));
  let notes=[],timeline=[],passages=[],recent=[],error='',coverage='',timelineTotal=0,missingEvents=0;
- const usableMemory=usableStoryMemory(s,all),diagnostics=memoryDiagnostics(s,all),order=sceneOrder(all),
+ const usableMemory=usableStoryMemory(s,all),diagnostics=memoryDiagnostics(s,all),suppressed=deletedTimelineScenes(s),order=sceneOrder(all),
  system='You are the fiction-writing collaborator. Follow the author’s current instructions and established canon. Write the requested continuation, maintaining character voice, chronology, emotional subtext and narrative style. The older timeline is historical reference, not a list of topics or motifs to repeat. Use it only to maintain accurate chronology, causality, individual knowledge and consequences. Prefer original prose and the current author instructions to extracted accounts. Historical observations are not permanent character traits or present facts. Do not narrate your memory process.';
  let base=system+(s.bible?'\n\nAUTHOR STORY BIBLE:\n'+s.bible:'');
  const user=prompt?{role:'user',content:prompt}:null,cost=m=>tokens(m.content)+8;
@@ -462,13 +464,14 @@ function context(s,prompt='',override,limitOverride){
    eventScenes=new Set(indexed.map(n=>n.sceneId)),
    events=indexed.filter(n=>!n.pinned);
   timelineTotal=events.length;
-  missingEvents=olderScenes.filter(m=>!eventScenes.has(m.id)).length;
+  missingEvents=olderScenes.filter(m=>!eventScenes.has(m.id)&&!suppressed.has(m.id)).length;
   const fmtEvent=n=>'Scene '+order.get(n.sceneId)+': '+n.text;
   const available=Math.max(0,cap-used-60);
   const chosen=timelineSelection(events,available,fmtEvent);
   for(const n of chosen){const t=fmtEvent(n);timeline.push(t);used+=tokens(t)+8}
   if(olderScenes.length){
-   coverage='Older timeline: '+eventScenes.size+'/'+olderScenes.length+' older scenes indexed; '+chosen.length+'/'+events.length+' summaries included.';
+   coverage='Older timeline: '+eventScenes.size+'/'+(olderScenes.length-olderScenes.filter(m=>suppressed.has(m.id)).length)+' eligible older scenes indexed; '+chosen.length+'/'+events.length+' summaries included.';
+   const deletedOlder=olderScenes.filter(m=>suppressed.has(m.id)).length;if(deletedOlder)coverage+=' '+deletedOlder+' timeline summaries intentionally deleted by the author.';
    if(missingEvents)coverage+=' '+missingEvents+' older scenes have no timeline entry.';
    if(chosen.length<events.length)coverage+=' '+(events.length-chosen.length)+' summaries did not fit the input budget. Increase the input budget to include them.';
    if(!events.length){coverage+=' No eligible timeline summaries are available.';if(diagnostics.staged)coverage+=' '+diagnostics.staged+' completed rebuild entries are available for matching active scenes.';if(diagnostics.archived)coverage+=' '+diagnostics.archived+' stored timeline entries refer to inactive or replaced story messages and are excluded.';if(diagnostics.checkpoint&&!diagnostics.staged)coverage+=' A rebuild checkpoint exists, but it has no source-valid entries for this scene.';if(!diagnostics.raw&&!diagnostics.staged)coverage+=' Update memory to generate timelines for active scenes.';}
@@ -723,8 +726,8 @@ function regen(m){if(busy)return;generate('',m)}
 function unindexed(s){
  // An older extraction may have marked scenes indexed without producing a timeline.
  // Repair those gaps instead of requiring a full rebuild.
- const all=activeComplete(s),covered=new Set(timelineEntries(eligibleMemory(s,all),all).map(n=>n.sceneId));
- return all.filter(m=>m.role==='assistant'&&(!s.indexed.includes(m.id)||!covered.has(m.id)))
+ const all=activeComplete(s),suppressed=deletedTimelineScenes(s),covered=new Set(timelineEntries(usableStoryMemory(s,all),all).map(n=>n.sceneId));
+ return all.filter(m=>m.role==='assistant'&&!suppressed.has(m.id)&&(!s.indexed.includes(m.id)||!covered.has(m.id)))
 }
 function memoryBatch(s,candidates=unindexed(s),limit=Number(state.settings.memoryLimit||65536),opts={}){
  const all=activeComplete(s),hard=Math.min(50000,Math.max(1000,limit-8500)),cap=Math.min(opts.maxTokens||3600,hard),maxScenes=opts.maxScenes||2,batch=[],source=[],ids=new Set();let n=0;
@@ -740,12 +743,12 @@ function rebuildMatches(s,scenes){
  const cp=s.memoryRebuild;return !!cp&&cp.version===1&&Array.isArray(cp.sceneIds)&&Array.isArray(cp.entries)&&Array.isArray(cp.completedIds)&&cp.sceneIds.length===scenes.length&&cp.sceneIds.every((id,i)=>id===scenes[i].id);
 }
 function memorySummary(s){
- const all=activeComplete(s),notes=usableStoryMemory(s,all),events=timelineEntries(notes,all),total=all.filter(m=>m.role==='assistant').length,covered=new Set(events.map(n=>n.sceneId)).size,diagnostics=memoryDiagnostics(s,all);
- return {all,notes,events,total,covered,diagnostics,current:latestSituation(notes,all),legacy:notes.filter(n=>!n.kind&&!memoryPreserved(n)).length}
+ const all=activeComplete(s),notes=usableStoryMemory(s,all),events=timelineEntries(notes,all),removed=all.filter(m=>m.role==='assistant'&&deletedTimelineScenes(s).has(m.id)).length,total=all.filter(m=>m.role==='assistant').length-removed,covered=new Set(events.map(n=>n.sceneId)).size,diagnostics=memoryDiagnostics(s,all);
+ return {all,notes,events,total,covered,removed,diagnostics,current:latestSituation(notes,all),legacy:notes.filter(n=>!n.kind&&!memoryPreserved(n)).length}
 }
 function updateMemoryProgress(s){
  const pending=unindexed(s).reduce((a,m)=>a+tokens(m.content),0),t=Number(state.settings.memoryThreshold||25000),job=memoryJobs.get(s.id),summary=memorySummary(s),checkpoint=s.memoryRebuild,done=checkpoint?.completedIds?.length||0,total=checkpoint?.sceneIds?.length||0;
- $('memoryProgress').textContent=(job?job.progress||'Updating memory…':memoryErrors.get(s.id)||(!state.settings.memoryModel?'Choose a memory model in settings':!state.settings.autoMemory?'Automatic updates off':fmt(pending)+' / '+fmt(t)+' new prose tokens'))+(checkpoint?' · Rebuild checkpoint '+done+'/'+total+' scenes (resume available)':'')+' · Timeline '+summary.covered+'/'+summary.total+' scenes'+(summary.diagnostics.staged?' · '+summary.diagnostics.staged+' provisional rebuild entries usable':'')+(summary.diagnostics.archived?' · '+summary.diagnostics.archived+' entries linked to inactive versions':'')+(summary.legacy?' · Legacy notes: rebuild for a complete timeline':'');
+ $('memoryProgress').textContent=(job?job.progress||'Updating memory…':memoryErrors.get(s.id)||(!state.settings.memoryModel?'Choose a memory model in settings':!state.settings.autoMemory?'Automatic updates off':fmt(pending)+' / '+fmt(t)+' new prose tokens'))+(checkpoint?' · Rebuild checkpoint '+done+'/'+total+' scenes (resume available)':'')+' · Timeline '+summary.covered+'/'+summary.total+' eligible scenes'+(summary.removed?' · '+summary.removed+' intentionally deleted':'')+(summary.diagnostics.staged?' · '+summary.diagnostics.staged+' provisional rebuild entries usable':'')+(summary.diagnostics.archived?' · '+summary.diagnostics.archived+' entries linked to inactive versions':'')+(summary.legacy?' · Legacy notes: rebuild for a complete timeline':'');
  $('extractBtn').disabled=!!job||busy;$('rebuildMemory').textContent=$('archiveRebuild').textContent=checkpoint?'Resume rebuild ('+done+'/'+total+')':'Rebuild memory';$('rebuildMemory').disabled=!!job||busy;$('archiveRebuild').disabled=!!job||busy;$('archiveUpdate').disabled=!!job||busy;
  if($('archive').open&&archiveMode==='memory')$('archiveMemoryStatus').textContent=$('memoryProgress').textContent
 }
@@ -758,7 +761,7 @@ function maybeMemory(s){
  }
  if(n>=Number(state.settings.memoryThreshold||25000)||early)void extract(false,s)
 }
-function branchFrom(m){if(busy)return;let s=active(),i=s.messages.indexOf(m);if(i<0)return;let name=window.prompt('Name the alternate story',s.title+' · alternate');if(name===null)return;let b={...structuredClone(s),id:uid(),title:name.trim()||s.title+' · alternate',favorite:false,created:now(),updated:now(),draft:''};delete b.memoryRebuild;b.messages=b.messages.slice(0,i+1).filter(x=>x.active!==false);let ids=new Set(b.messages.map(x=>x.id));b.memory=b.memory.filter(n=>!n.sources?.length||n.sources.every(x=>ids.has(x)));b.indexed=b.indexed.filter(x=>ids.has(x));state.stories.push(b);state.active=b.id;$('prompt').value='';save();render(true);status('Alternate story created. Original is unchanged.');maybeMemory(b)}
+function branchFrom(m){if(busy)return;let s=active(),i=s.messages.indexOf(m);if(i<0)return;let name=window.prompt('Name the alternate story',s.title+' · alternate');if(name===null)return;let b={...structuredClone(s),id:uid(),title:name.trim()||s.title+' · alternate',favorite:false,created:now(),updated:now(),draft:''};delete b.memoryRebuild;b.messages=b.messages.slice(0,i+1).filter(x=>x.active!==false);let ids=new Set(b.messages.map(x=>x.id));b.memory=b.memory.filter(n=>!n.sources?.length||n.sources.every(x=>ids.has(x)));b.indexed=b.indexed.filter(x=>ids.has(x));b.deletedTimeline=(b.deletedTimeline||[]).filter(x=>ids.has(x.sceneId));state.stories.push(b);state.active=b.id;$('prompt').value='';save();render(true);status('Alternate story created. Original is unchanged.');maybeMemory(b)}
 function pinScene(m){if(busy)return;let s=active();let text=window.prompt('What should always be remembered from this scene?',m.content.slice(0,700));if(!text?.trim())return;s.memory.push({id:uid(),type:'Small detail',text:text.trim(),pinned:true,sources:[m.id],created:now()});save();renderMemory();updateContext()}
 // Give the memory model short request-local labels, then map only verified
 // references back to the original persistent message IDs.
@@ -798,7 +801,7 @@ async function extract(manual=true,s=active(),rebuild=false){
   if(manual&&!wasStaged&&!confirm('Build a new timeline from all '+sceneList.length+' accepted scenes? Existing memories stay untouched until the rebuild finishes. The app saves a checkpoint after each batch so you can resume if a call fails. This uses your configured memory model quota or paid balance.'))return;
   s.memoryRebuild={version:1,sceneIds:sceneList.map(m=>m.id),completedIds:[],entries:[],started:now()};
  }
- const checkpoint=rebuild?s.memoryRebuild:null,completed=new Set(checkpoint?.completedIds||[]),pending=rebuild?sceneList.filter(m=>!completed.has(m.id)):unindexed(s);
+ const checkpoint=rebuild?s.memoryRebuild:null,completed=new Set(checkpoint?.completedIds||[]),suppressed=deletedTimelineScenes(s),pending=rebuild?sceneList.filter(m=>!completed.has(m.id)&&!suppressed.has(m.id)):unindexed(s);
  if(!pending.length&&!rebuild){if(manual)status('Memory is up to date.');return}
  if(manual&&!rebuild&&!confirm('Update the timeline for '+pending.length+' uncovered scene(s)? This uses your configured memory model quota or paid balance.'))return;
  const model=state.settings.memoryModel,billing=state.settings.memoryBilling,limit=Number(state.settings.memoryLimit||65536),abort=new AbortController(),initialIds=snapshot.map(m=>m.id);
@@ -843,11 +846,11 @@ async function extract(manual=true,s=active(),rebuild=false){
    }
    if(!stillValid(source))throw Error('The story changed during extraction. Previous completed batches were preserved.');
    if(rebuild){
-    mergeMemory(checkpoint.entries,parsed.valid);
+    mergeMemory(checkpoint.entries,parsed.valid.filter(n=>!deletedTimelineScenes(s).has(n.sceneId)));
     checkpoint.completedIds.push(...batch.map(m=>m.id));
     await save(); // Save each completed rebuild batch before requesting the next.
    }else{
-    mergeMemory(s.memory,parsed.valid);
+    mergeMemory(s.memory,parsed.valid.filter(n=>!deletedTimelineScenes(s).has(n.sceneId)));
     s.indexed=[...new Set([...s.indexed,...batch.map(m=>m.id)])];
     await save();
    }
@@ -859,7 +862,7 @@ async function extract(manual=true,s=active(),rebuild=false){
   if(rebuild){
    if(!stillValid(snapshot))throw Error('The story changed before the rebuilt timeline could be saved. Checkpoint retained.');
    const oldMemory=s.memory,oldIndexed=s.indexed;
-   s.memory=mergeMemory(oldMemory.filter(memoryPreserved),checkpoint.entries);
+   s.memory=mergeMemory(oldMemory.filter(memoryPreserved).filter(n=>!deletedTimelineScenes(s).has(n.sceneId)),checkpoint.entries.filter(n=>!deletedTimelineScenes(s).has(n.sceneId)));
    s.indexed=sceneList.map(m=>m.id);
    delete s.memoryRebuild;
    try{await save()}catch(e){s.memory=oldMemory;s.indexed=oldIndexed;s.memoryRebuild=checkpoint;throw e}
