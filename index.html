@@ -359,7 +359,31 @@ function rank(items,query){const q=[...new Set(words(query))].slice(0,180);if(!q
 // The original transcript remains the source of truth. All extracted entries
 // are source-linked; chronology is based on active scene order, not extraction time.
 function activeComplete(s){return s.messages.filter(m=>m.active!==false&&m.status!=='partial')}
-function eligibleMemory(s,all=activeComplete(s)){const ids=new Set(all.map(m=>m.id));return s.memory.filter(n=>(!n.sources?.length||n.sources.every(id=>ids.has(id)))&&(!n.sceneId||ids.has(n.sceneId)))}
+function normalizeTimelineNote(n,all){
+ if(n.kind==='event'||n.type!=='Timeline')return n;
+ const assistants=new Set(all.filter(m=>m.role==='assistant').map(m=>m.id));
+ const options=(n.sources||[]).filter(id=>assistants.has(id));
+ const sceneId=n.sceneId&&assistants.has(n.sceneId)?n.sceneId:options.length===1?options[0]:null;
+ return sceneId?{...n,kind:'event',sceneId}:n;
+}
+function eligibleMemory(s,all=activeComplete(s)){
+ const ids=new Set(all.map(m=>m.id));
+ return (s.memory||[]).filter(n=>(!n.sources?.length||n.sources.every(id=>ids.has(id)))&&(!n.sceneId||ids.has(n.sceneId))).map(n=>normalizeTimelineNote(n,all));
+}
+function usableStoryMemory(s,all=activeComplete(s)){
+ const stored=eligibleMemory(s,all),cp=s.memoryRebuild?.entries||[],
+ drafts=eligibleMemory({memory:cp},all).map(n=>({...n,fromCheckpoint:true}));
+ return [...stored,...drafts];
+}
+function memoryDiagnostics(s,all=activeComplete(s)){
+ const main=(s.memory||[]).filter(n=>n.kind==='event'||n.type==='Timeline'),
+ staged=s.memoryRebuild?.entries||[],activeIds=new Set(all.map(m=>m.id)),
+ activeMain=timelineEntries(eligibleMemory(s,all),all),activeDraft=timelineEntries(eligibleMemory({memory:staged},all),all),
+ archived=main.filter(n=>(n.sources||[]).some(id=>!activeIds.has(id))||(n.sceneId&&!activeIds.has(n.sceneId))).length,
+ unmapped=main.filter(n=>!activeMain.some(e=>e.id===n.id)&&!(n.sources||[]).some(id=>!activeIds.has(id))&&(!n.sceneId||activeIds.has(n.sceneId))).length;
+ const total=timelineEntries(usableStoryMemory(s,all),all).length;
+ return {total,stored:activeMain.length,staged:activeDraft.length,archived,unmapped,raw:main.length,checkpoint:!!s.memoryRebuild,checkpointProgress:s.memoryRebuild?.completedIds?.length||0};
+}
 function sceneOrder(all){return new Map(all.filter(m=>m.role==='assistant').map((m,i)=>[m.id,i+1]))}
 function timelineEntries(notes,all){
  const order=sceneOrder(all),chosen=new Map();
@@ -388,7 +412,7 @@ function context(s,prompt='',override,limitOverride){
  all=override||activeComplete(s),
  cap=Math.max(0,Math.min(Number(s.budget),Number(set.modelLimit)-Number(set.maxOutput)-512));
  let notes=[],timeline=[],passages=[],recent=[],error='',coverage='',timelineTotal=0,missingEvents=0;
- const usableMemory=eligibleMemory(s,all),order=sceneOrder(all),
+ const usableMemory=usableStoryMemory(s,all),diagnostics=memoryDiagnostics(s,all),order=sceneOrder(all),
  system='You are the fiction-writing collaborator. Follow the author’s current instructions and established canon. Write the requested continuation, maintaining character voice, chronology, emotional subtext and narrative style. The older timeline is historical reference, not a list of topics or motifs to repeat. Use it only to maintain accurate chronology, causality, individual knowledge and consequences. Prefer original prose and the current author instructions to extracted accounts. Historical observations are not permanent character traits or present facts. Do not narrate your memory process.';
  let base=system+(s.bible?'\n\nAUTHOR STORY BIBLE:\n'+s.bible:'');
  const user=prompt?{role:'user',content:prompt}:null,cost=m=>tokens(m.content)+8;
@@ -415,9 +439,9 @@ function context(s,prompt='',override,limitOverride){
   for(let i=end;i>=0;i--){
    const m=all[i],c=cost(m),nextCost=recentCost+c;
    if(nextCost>cap-used){if(!recent.length)error='Most recent message does not fit. Increase context budget.';break}
-   const nextTimelineCost=remainingCost-(eventCostByScene.get(m.id)||0);
+   const nextTimelineCost=remainingCost-(eventCostByScene.get(m.id)||0),recoveryReserve=!allEvents.length?Math.min(2200,Math.floor(Math.max(0,cap-used)*.16)):0;
    const obligatory=recent.length<anchorCount;
-   if(!obligatory&&(nextCost>recentMax||used+nextCost+nextTimelineCost+90>cap))break;
+   if(!obligatory&&(nextCost>recentMax||used+nextCost+nextTimelineCost+90+recoveryReserve>cap))break;
    recent.unshift(m);recentCost=nextCost;remainingCost=nextTimelineCost;
   }
   used+=recentCost;
@@ -447,6 +471,7 @@ function context(s,prompt='',override,limitOverride){
    coverage='Older timeline: '+eventScenes.size+'/'+olderScenes.length+' older scenes indexed; '+chosen.length+'/'+events.length+' summaries included.';
    if(missingEvents)coverage+=' '+missingEvents+' older scenes have no timeline entry.';
    if(chosen.length<events.length)coverage+=' '+(events.length-chosen.length)+' summaries did not fit the input budget. Increase the input budget to include them.';
+   if(!events.length){coverage+=' No eligible timeline summaries are available.';if(diagnostics.staged)coverage+=' '+diagnostics.staged+' completed rebuild entries are available for matching active scenes.';if(diagnostics.archived)coverage+=' '+diagnostics.archived+' stored timeline entries refer to inactive or replaced story messages and are excluded.';if(diagnostics.checkpoint&&!diagnostics.staged)coverage+=' A rebuild checkpoint exists, but it has no source-valid entries for this scene.';if(!diagnostics.raw&&!diagnostics.staged)coverage+=' Update memory to generate timelines for active scenes.';}
    used+=tokens(coverage)+8;
   }
   // Generated detail cards are retained as reference, but not sent automatically.
@@ -457,6 +482,17 @@ function context(s,prompt='',override,limitOverride){
  // Original excerpts are strictly optional and can only occupy leftover room.
  if(s.mode==='smart'&&!shortFull){
   const chosen=[];
+  // If the timeline is genuinely unavailable, use a few chronologically
+  // distributed ORIGINAL active scenes as a temporary, explicitly partial
+  // fallback, rather than silently supplying only the latest responses.
+  if(!timeline.length&&olderScenes.length){
+   const indices=[0,Math.floor((olderScenes.length-1)/2),olderScenes.length-1],seen=new Set();
+   for(const index of indices){
+    const m=olderScenes[index];if(!m||seen.has(m.id))continue;seen.add(m.id);
+    const excerpt=m.content.slice(0,2200),text='[PARTIAL ORIGINAL SCENE '+order.get(m.id)+' / source '+m.id.slice(0,8)+'; excerpt only, not a complete timeline]\n'+excerpt;
+    const ct=tokens(text)+12;if(used+ct<=cap){chosen.push({id:m.id,part:0,text});used+=ct}
+   }
+  }
   for(const c of rank(older.flatMap(chunks),query)){
    if(c.score<=0)break;
    const text='[Original '+c.role+' passage '+c.id.slice(0,8)+' / '+c.part+']\n'+c.text,ct=tokens(text)+12;
@@ -475,9 +511,9 @@ function context(s,prompt='',override,limitOverride){
  return {messages,used:actual,cap,recent:recent.length,recentReplies:recent.filter(m=>m.role==='assistant').length,
   totalReplies:all.filter(m=>m.role==='assistant').length,passages:passages.length,notes:notes.length,
   timeline:timeline.length,timelineTotal,timelineOmitted:Math.max(0,timelineTotal-timeline.length),
-  missingEvents,situation:false,error,shortFull,archive:historyCost};
+  missingEvents,diagnostics,situation:false,error,shortFull,archive:historyCost};
 }
-function updateContext(){let s=active();if(!s)return;const c=context(s,$('prompt').value.trim());$('contextPill').textContent=fmt(c.used)+' input';$('ctxCount').textContent=fmt(c.used)+' / '+fmt(c.cap);$('ctxLabel').textContent=c.error||`${c.recentReplies}/${c.totalReplies} full AI replies · ${c.timeline}/${c.timelineTotal} older timeline entries · ${c.notes} notes · ${c.passages} excerpts`+(c.missingEvents?' · '+c.missingEvents+' older scenes without timeline':'')+(c.timelineOmitted?' · '+c.timelineOmitted+' summaries not included (increase input budget)':'');$('ctxMeter').style.width=Math.min(100,100*c.used/Math.max(1,c.cap))+'%';$('archiveCount').textContent=fmt(c.archive)+' active story tokens';$('subtitle').textContent=writingModel(s)+' · '+s.mode+' context';updateMemoryProgress(s);}
+function updateContext(){let s=active();if(!s)return;const c=context(s,$('prompt').value.trim());$('contextPill').textContent=fmt(c.used)+' input';$('ctxCount').textContent=fmt(c.used)+' / '+fmt(c.cap);$('ctxLabel').textContent=c.error||`${c.recentReplies}/${c.totalReplies} full AI replies · ${c.timeline}/${c.timelineTotal} older timeline entries · ${c.notes} notes · ${c.passages} excerpts`+(c.missingEvents?' · '+c.missingEvents+' older scenes without timeline':'')+(c.timelineOmitted?' · '+c.timelineOmitted+' summaries not included (increase input budget)':'')+(!c.timelineTotal&&c.missingEvents?' · No matching saved summaries; open Story memory':'');$('ctxMeter').style.width=Math.min(100,100*c.used/Math.max(1,c.cap))+'%';$('archiveCount').textContent=fmt(c.archive)+' active story tokens';$('subtitle').textContent=writingModel(s)+' · '+s.mode+' context';updateMemoryProgress(s);}
 function renderLibrary(){let q=$('librarySearch').value.toLowerCase().trim();let items=state.stories.filter(s=>s.title.toLowerCase().includes(q)).sort((a,b)=>Number(!!b.favorite)-Number(!!a.favorite)||String(b.updated||b.created).localeCompare(String(a.updated||a.created)));$('stories').replaceChildren(...items.map(x=>{let row=el('div','story-entry');let b=btn(x.title,()=>{if(busy)return;state.active=x.id;displayCount=25;$('prompt').value=x.draft||'';save();render(true);closePanels();maybeMemory(x)},'story'+(x.id===state.active?' active':''));b.append(el('span','story-label',x.updated?new Date(x.updated).toLocaleDateString(undefined,{month:'short',day:'numeric'}):''));let f=btn(x.favorite?'★':'☆',()=>{x.favorite=!x.favorite;save();renderLibrary()},'ghost fav'+(x.favorite?' on':''));f.setAttribute('aria-label',x.favorite?'Remove favourite':'Favourite story');row.append(b,f);return row}));if(!items.length)$('stories').append(el('p','library-empty','No matching stories.'))}
 // Render common fiction emphasis without ever interpreting model-supplied HTML.
 // Raw Markdown remains the source of truth for editing, copying, memory and exports.
@@ -591,13 +627,13 @@ const memoryGroups=[
 function memoryGroup(title,items,open=false){const d=el('details','memory-group'),h=el('summary','');h.append(el('strong','grow',title),el('span','muted',String(items.length)));d.append(h);d.open=open;const body=el('div','memory-group-body');if(!items.length)body.append(el('p','muted','No entries yet.'));else for(const n of items)body.append(memoryCard(n));d.append(body);return d}
 function renderMemory(){
  const s=active(),r=$('memoryList');r.replaceChildren();if(!s)return;const m=memorySummary(s);
- const t=el('div','memorycard memory-overview');t.append(el('strong','','Story timeline'),el('p','muted',m.covered+'/'+m.total+' scenes with timeline entries'),btn('View timeline',()=>openArchive('memory'),'small'));r.append(t);
+ const t=el('div','memorycard memory-overview');t.append(el('strong','','Story timeline'),el('p','muted',m.covered+'/'+m.total+' scenes with timeline entries'+(m.diagnostics.staged?' · '+m.diagnostics.staged+' from unfinished rebuild':'')+(m.diagnostics.archived?' · '+m.diagnostics.archived+' linked to inactive versions':'')),btn('View timeline',()=>openArchive('memory'),'small'));r.append(t);
  if(m.legacy)r.append(el('p','field-help','Older memory notes are preserved. Rebuild memory to create a scene-by-scene timeline.'));
  for(const n of m.notes.filter(n=>n.pinned&&n.kind!=='event').slice(0,3))r.append(memoryCard(n));
 }
 function memoryCard(n){
- const d=el('div','memorycard'),all=activeComplete(active()),order=sceneOrder(all),archived=!eligibleMemory(active(),all).includes(n);
- d.append(el('div','tag',(n.pinned?'Pinned · ':'')+(n.kind==='event'?'Scene '+(order.get(n.sceneId)||'?')+' · Timeline':n.type)),el('p','',n.text),el('div','muted',n.sources?.length?'Source: '+n.sources.map(x=>x.slice(0,8)).join(', ')+(archived?' · inactive source (excluded from context)':''):'Author note'),btn('Edit',()=>openMemory(n)));
+ const d=el('div','memorycard'),all=activeComplete(active()),order=sceneOrder(all),archived=!usableStoryMemory(active(),all).some(x=>x.id===n.id);
+ d.append(el('div','tag',(n.fromCheckpoint?'Rebuild draft · ':n.pinned?'Pinned · ':'')+(n.kind==='event'?'Scene '+(order.get(n.sceneId)||'?')+' · Timeline':n.type)),el('p','',n.text),el('div','muted',n.sources?.length?'Source: '+n.sources.map(x=>x.slice(0,8)).join(', ')+(archived?' · inactive source (excluded from context)':''):'Author note'),n.fromCheckpoint?el('span','muted','Complete rebuild to edit this entry'):btn('Edit',()=>openMemory(n)));
  if(n.sources?.length)d.append(btn('Read source',()=>{const ss=active();archiveMode='sources';$('archiveTitle').textContent='Original source passages';$('archiveSearch').hidden=true;$('archiveMemoryTools').hidden=true;const r=$('archiveResults');r.replaceChildren(btn('← Back to memory',()=>{archiveMode='memory';$('archiveTitle').textContent='Story memory';$('archiveSearch').hidden=false;renderArchive()},'small'),...n.sources.map(id=>{const m=ss.messages.find(x=>x.id===id),e=el('div','memorycard');e.append(el('div','tag',m?.role||'Missing source'),el('p','',m?.content||'Source not available.'));return e}));if(!$('archive').open)show('archive')},'small source-link'));return d
 }
 function setBusy(v){busy=v;for(const id of ['sendBtn','continueBtn','newStory','extractBtn','rebuildMemory','archiveRebuild','importBtn','settingsBtn','modelBtn','generationBtn','storyBtn','editStoryBtn','readerToggle','moreBtn'])$(id).disabled=v;$('extractBtn').disabled=v||memoryJobs.has(active()?.id);$('rebuildMemory').disabled=$('archiveRebuild').disabled=$('archiveUpdate').disabled=v||memoryJobs.has(active()?.id);$('stopBtn').classList.toggle('hidden',!v)}
@@ -704,12 +740,12 @@ function rebuildMatches(s,scenes){
  const cp=s.memoryRebuild;return !!cp&&cp.version===1&&Array.isArray(cp.sceneIds)&&Array.isArray(cp.entries)&&Array.isArray(cp.completedIds)&&cp.sceneIds.length===scenes.length&&cp.sceneIds.every((id,i)=>id===scenes[i].id);
 }
 function memorySummary(s){
- const all=activeComplete(s),notes=eligibleMemory(s,all),events=timelineEntries(notes,all),total=all.filter(m=>m.role==='assistant').length,covered=new Set(events.map(n=>n.sceneId)).size;
- return {all,notes,events,total,covered,current:latestSituation(notes,all),legacy:notes.filter(n=>!n.kind&&!memoryPreserved(n)).length}
+ const all=activeComplete(s),notes=usableStoryMemory(s,all),events=timelineEntries(notes,all),total=all.filter(m=>m.role==='assistant').length,covered=new Set(events.map(n=>n.sceneId)).size,diagnostics=memoryDiagnostics(s,all);
+ return {all,notes,events,total,covered,diagnostics,current:latestSituation(notes,all),legacy:notes.filter(n=>!n.kind&&!memoryPreserved(n)).length}
 }
 function updateMemoryProgress(s){
  const pending=unindexed(s).reduce((a,m)=>a+tokens(m.content),0),t=Number(state.settings.memoryThreshold||25000),job=memoryJobs.get(s.id),summary=memorySummary(s),checkpoint=s.memoryRebuild,done=checkpoint?.completedIds?.length||0,total=checkpoint?.sceneIds?.length||0;
- $('memoryProgress').textContent=(job?job.progress||'Updating memory…':memoryErrors.get(s.id)||(!state.settings.memoryModel?'Choose a memory model in settings':!state.settings.autoMemory?'Automatic updates off':fmt(pending)+' / '+fmt(t)+' new prose tokens'))+(checkpoint?' · Rebuild checkpoint '+done+'/'+total+' scenes (resume available)':'')+' · Timeline '+summary.covered+'/'+summary.total+' scenes'+(summary.legacy?' · Legacy notes: rebuild for a complete timeline':'');
+ $('memoryProgress').textContent=(job?job.progress||'Updating memory…':memoryErrors.get(s.id)||(!state.settings.memoryModel?'Choose a memory model in settings':!state.settings.autoMemory?'Automatic updates off':fmt(pending)+' / '+fmt(t)+' new prose tokens'))+(checkpoint?' · Rebuild checkpoint '+done+'/'+total+' scenes (resume available)':'')+' · Timeline '+summary.covered+'/'+summary.total+' scenes'+(summary.diagnostics.staged?' · '+summary.diagnostics.staged+' provisional rebuild entries usable':'')+(summary.diagnostics.archived?' · '+summary.diagnostics.archived+' entries linked to inactive versions':'')+(summary.legacy?' · Legacy notes: rebuild for a complete timeline':'');
  $('extractBtn').disabled=!!job||busy;$('rebuildMemory').textContent=$('archiveRebuild').textContent=checkpoint?'Resume rebuild ('+done+'/'+total+')':'Rebuild memory';$('rebuildMemory').disabled=!!job||busy;$('archiveRebuild').disabled=!!job||busy;$('archiveUpdate').disabled=!!job||busy;
  if($('archive').open&&archiveMode==='memory')$('archiveMemoryStatus').textContent=$('memoryProgress').textContent
 }
@@ -845,23 +881,23 @@ function renderArchive(){
  if(archiveMode==='memory'){
   const m=memorySummary(s),match=n=>!q||(n.text+' '+n.type).toLowerCase().includes(q);
   const events=m.events.filter(match),legacyTimeline=m.notes.filter(n=>n.type==='Timeline'&&n.kind!=='event'&&match(n));
-  r.append(el('p','muted',m.covered+'/'+m.total+' scenes covered · '+m.events.length+' timeline entries'+(m.legacy?' · rebuild recommended':'')+(q?' · filtered results':'')));
+  r.append(el('p','muted',m.covered+'/'+m.total+' scenes covered · '+m.events.length+' timeline entries'+(m.diagnostics.staged?' · '+m.diagnostics.staged+' provisional rebuild entries':'')+(m.diagnostics.archived?' · '+m.diagnostics.archived+' inactive-source entries excluded':'')+(m.diagnostics.unmapped?' · '+m.diagnostics.unmapped+' unlinked older notes':'')+(m.legacy?' · rebuild recommended':'')+(q?' · filtered results':'')));
   const timeline=memoryGroup('Story timeline',events,true);const body=timeline.querySelector('.memory-group-body');
-  if(m.covered<m.total)body.prepend(el('p','field-help','Timeline is incomplete. Update memory for new scenes, or rebuild to cover previously indexed scenes.'));
+  if(m.covered<m.total)body.prepend(el('p','field-help','Timeline is incomplete. Update memory to cover missing active scenes, or resume a paused rebuild. Entries from archived or replaced scenes are not reused automatically.'));
   if(legacyTimeline.length){const legacy=memoryGroup('Earlier timeline notes (not scene-indexed)',legacyTimeline,false);body.append(legacy)}r.append(timeline);
   // Existing reference notes are preserved, but not required for routine writing.
   const pinned=m.notes.filter(n=>n.pinned&&n.kind!=='event'&&match(n));
   if(pinned.length)r.append(memoryGroup('Pinned facts and author notes',pinned,false));
   const legacy=m.notes.filter(n=>n.kind!=='event'&&!n.pinned&&n.type!=='Timeline'&&match(n));
   if(legacy.length)r.append(memoryGroup('Older reference notes (kept for reference)',legacy,false));
-  const inactive=s.memory.filter(n=>!m.notes.includes(n)&&match(n));
+  const activeNoteIds=new Set(m.notes.map(n=>n.id)),inactive=s.memory.filter(n=>!activeNoteIds.has(n.id)&&match(n));
   if(inactive.length)r.append(memoryGroup('Inactive / archived notes',inactive,false));
   return;
  }
  const items=s.messages.filter(m=>m.content.toLowerCase().includes(q));r.append(el('p','muted',items.length+' results'+(items.length>100?' · showing newest 100':'')));
  for(const m of items.slice(-100).reverse()){const d=el('div','memorycard'),text=m.content,i=q?text.toLowerCase().indexOf(q):0,start=Math.max(0,i-100);d.append(el('div','tag',m.role+' · '+m.id.slice(0,8)+(m.active===false?' · archived':'')),el('p','',text.slice(start,start+550)+(text.length>start+550?'…':'')),btn('Read original',()=>{d.querySelector('p').textContent=text}),btn('Copy',()=>navigator.clipboard.writeText(text).catch(()=>{})));r.append(d)}
 }
-function preview(){let c=context(active(),$('prompt').value.trim());$('previewMeta').textContent=fmt(c.used)+' estimated input tokens · '+c.recentReplies+'/'+c.totalReplies+' full AI replies · '+c.recent+' history messages · '+c.passages+' retrieved excerpts · '+c.timeline+'/'+c.timelineTotal+' older timeline entries · '+c.notes+' notes'+(c.missingEvents?' · '+c.missingEvents+' older scenes without timeline':'')+(c.timelineOmitted?' · '+c.timelineOmitted+' summaries not included (increase input budget)':'')+(c.error?' · '+c.error:'');$('previewText').textContent=c.messages.map(m=>'['+m.role.toUpperCase()+']\n'+m.content).join('\n\n');show('preview')}
+function preview(){let c=context(active(),$('prompt').value.trim());$('previewMeta').textContent=fmt(c.used)+' estimated input tokens · '+c.recentReplies+'/'+c.totalReplies+' full AI replies · '+c.recent+' history messages · '+c.passages+' retrieved excerpts · '+c.timeline+'/'+c.timelineTotal+' older timeline entries · '+c.notes+' notes'+(c.missingEvents?' · '+c.missingEvents+' older scenes without timeline':'')+(c.timelineOmitted?' · '+c.timelineOmitted+' summaries not included (increase input budget)':'')+(!c.timelineTotal&&c.missingEvents?' · No matching timeline; check Story memory for inactive sources / rebuild progress':'')+(c.error?' · '+c.error:'');$('previewText').textContent=c.messages.map(m=>'['+m.role.toUpperCase()+']\n'+m.content).join('\n\n');show('preview')}
 function getContent(m){if(typeof m.content==='string')return m.content;if(typeof m.text==='string')return m.text;let parts=Array.isArray(m.content)?m.content:Array.isArray(m.contentParts)?m.contentParts:Array.isArray(m.parts)?m.parts:[];return parts.map(p=>typeof p==='string'?p:(p.type==='text'||!p.type)?(p.text||p.content||''):'').filter(x=>typeof x==='string').join('\n')}
 function importData(data){if(data?.format==='elsewrite-v1'&&Array.isArray(data.stories)){return data.stories.filter(s=>Array.isArray(s.messages)).map(s=>{const imported={...newStory(),...s,id:uid(),messages:s.messages.filter(m=>['user','assistant'].includes(m.role)&&typeof m.content==='string'),memory:Array.isArray(s.memory)?s.memory:[],indexed:Array.isArray(s.indexed)?s.indexed:[]};return imported})}let found=[],seen=new Set();function walk(x){if(!x||typeof x!=='object'||seen.has(x))return;seen.add(x);if(Array.isArray(x.messages)){let s=newStory(x.name||x.title||'Imported story');for(let m of x.messages){let role=m.role||m.author?.role,content=getContent(m);if(role==='system'&&content)s.bible+=(s.bible?'\n\n':'')+content;else if(['user','assistant'].includes(role)&&content)s.messages.push(msg(role,content,{model:m.model||undefined}))}if(s.messages.length)found.push(s);return}if(Array.isArray(x)&&x.length&&x.every(m=>m&&typeof m==='object'&&m.role)){walk({messages:x});return}for(let v of Object.values(x))if(v&&typeof v==='object')walk(v)}walk(data);return found}
 $('newStory').onclick=()=>{$('newTitle').value='';$('newPremise').value='';$('usePreferences').checked=true;closePanels();show('newDialog')};$('beginStory').onclick=()=>{let s=newStory($('newTitle').value.trim()||'Untitled story');s.bible=$('usePreferences').checked?state.settings.globalBible:'';s.draft=$('newPremise').value;state.stories.push(s);state.active=s.id;displayCount=25;$('prompt').value=s.draft;save();$('newDialog').close();render(true);$('prompt').focus()};$('librarySearch').oninput=renderLibrary;$('readerToggle').onclick=()=>{let st=active();if(!st)return;$('moreDialog').close();let scroll=$('scroll'),position=scroll.scrollTop;st.view=st.view==='reader'?'story':'reader';save();render();requestAnimationFrame(()=>{scroll.scrollTop=position})};$('settingsBtn').onclick=openSettings;$('modelBtn').onclick=()=>openModelPicker('active','quick');$('generationBtn').onclick=()=>openModelPicker('active','generation');$('moreBtn').onclick=()=>{closePanels();show('moreDialog')};$('menuBtn').onclick=()=>panel('side');$('memoryBtn').onclick=()=>{$('moreDialog').close();if(window.matchMedia('(max-width:1050px)').matches)panel('inspector');else $('inspector').scrollTop=0};$('moreArchive').onclick=()=>{$('moreDialog').close();openArchive()};$('backdrop').onclick=closePanels;document.querySelectorAll('[data-close]').forEach(b=>b.onclick=closePanels);document.querySelectorAll('[data-dialog-close]').forEach(b=>b.onclick=()=>b.closest('dialog').close());$('storyBtn').onclick=()=>{if(busy)return;$('moreDialog').close();$('storyName').value=active().title;show('storyDialog')};$('saveStory').onclick=()=>{let s=active();s.title=$('storyName').value.trim()||'Untitled story';save();$('storyDialog').close();render()};$('deleteStory').onclick=()=>{if(!confirm('Delete this story and its entire archive from this device? Export first if needed.'))return;memoryJobs.get(state.active)?.abort();state.stories=state.stories.filter(s=>s.id!==state.active);if(!state.stories.length)state.stories.push(newStory());state.active=state.stories[0].id;$('prompt').value=active().draft||'';save();$('storyDialog').close();render(true)};$('saveSettings').onclick=()=>{saveApiKey($('apiKey').value,$('rememberApiKey').checked);state.settings={...state.settings,model:$('modelId').value.trim()||defaults.model,maxOutput:bounded('maxOutput',256,100000,16384),modelLimit:bounded('modelLimit',4096,2000000,262144),memoryModel:$('memoryModel').value.trim(),autoMemory:$('autoMemory').checked,memoryThreshold:Number($('memoryThreshold').value),memoryLimit:bounded('memoryLimit',8192,2000000,65536),globalBible:$('globalBible').value,transport:$('transport').value,writingBilling:$('writingBilling').value,memoryBilling:$('memoryBilling').value,readingFont:$('readingFont').value,readingSize:bounded('readingSize',16,22,18),readingSpacing:$('readingSpacing').value};$('apiKey').value='';save();$('settings').close();render();status(keyStorageWarning|| (apiKey?(apiKeyPersisted?'API key saved on this device.':'API key ready for this tab.'):'No API key connected.'),!!keyStorageWarning);memoryErrors.clear();maybeMemory(active())};$('forgetApiKey').onclick=forgetApiKey;$('loadModels').onclick=async()=>{try{$('modelStatus').textContent='Loading…';await loadCatalog($('apiKey').value.trim(),$('transport').value,$('writingBilling').value);$('modelStatus').textContent=catalog.length+' chat models loaded'}catch(e){$('modelStatus').textContent=e.message}};$('sendBtn').onclick=()=>{let p=$('prompt').value.trim();if(p)generate(p)};$('continueBtn').onclick=()=>generate('Continue the story from the last scene.');$('stopBtn').onclick=()=>controller?.abort();let ctxTimer;$('prompt').oninput=()=>{resizeComposer();let s=active();if(s)s.draft=$('prompt').value;clearTimeout(ctxTimer);ctxTimer=setTimeout(()=>{ctxTimer=null;save();updateContext()},180)};$('prompt').onkeydown=e=>{if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)){e.preventDefault();$('sendBtn').click()}};$('inspectBtn').onclick=$('contextBtn').onclick=preview;$('addMemory').onclick=()=>openMemory();$('allMemoryBtn').onclick=()=>openArchive('memory');$('archiveBtn').onclick=()=>openArchive();$('archiveSearch').oninput=renderArchive;$('extractBtn').onclick=$('archiveUpdate').onclick=()=>extract(true,active());$('rebuildMemory').onclick=$('archiveRebuild').onclick=()=>extract(true,active(),true);$('saveMemory').onclick=()=>{let text=$('memoryText').value.trim();if(!text)return;let n=editingMemory||{id:uid(),created:now(),sources:[]};Object.assign(n,{type:n.kind==='event'?'Timeline':n.kind==='situation'?'Current situation':$('memoryType').value,text,pinned:$('memoryPin').checked,authorEdited:true});if(!editingMemory)active().memory.push(n);save();$('memoryDialog').close();render()};$('deleteMemory').onclick=()=>{if(editingMemory&&confirm('Delete this memory note? Original prose remains.')){active().memory=active().memory.filter(n=>n.id!==editingMemory.id);save();$('memoryDialog').close();render()}};$('importBtn').onclick=()=>$('fileInput').click();$('fileInput').onchange=async e=>{let f=e.target.files[0];if(!f)return;try{let stories=importData(JSON.parse(await f.text()));if(!stories.length)throw Error('No supported user/assistant messages found.');state.stories.push(...stories);state.active=stories[0].id;$('prompt').value=stories[0].draft||'';await save();displayCount=25;render(true);closePanels();status('Imported '+stories.length+' story/stories. Verify message counts and content.')}catch(err){status('Import failed: '+err.message,true)}finally{e.target.value=''}};function exportLibrary(){let data={format:'elsewrite-v1',exported:now(),stories:state.stories};let url=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:'application/json'}));let a=el('a');a.href=url;a.download='in-other-words-library-'+new Date().toISOString().replace(/[:.]/g,'-')+'.json';document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),30000);status('Library export requested. Check Files to confirm your backup (no API key included).')}
