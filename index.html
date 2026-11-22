@@ -959,7 +959,7 @@ function preview(){
  const main=fmt(c.used)+' estimated input tokens · '+c.recentReplies+'/'+c.totalReplies+' full AI replies · '+c.recent+' history messages';
  const extra=mode==='smart'?' · '+c.timeline+'/'+c.timelineTotal+' older timeline entries'+(c.missingEvents?' · '+c.missingEvents+' older scenes without summaries':'')+(c.timelineOmitted?' · '+c.timelineOmitted+' summaries did not fit':'')+' · '+c.passages+' excerpts':mode==='recent'?' · older timeline OFF · '+available+' saved timeline entries available': ' · complete original history';
  $('previewMeta').textContent='Context: '+contextModeLabel(mode)+' · '+main+extra+' · '+c.notes+' notes'+(c.error?' · '+c.error:'');
- $('previewModeHelp').textContent=mode==='recent'?'Recent-only mode intentionally excludes older timeline summaries. Switch to Smart to include existing summaries whenever they match the active story.':mode==='full'?'Full mode sends the original active story instead of separate timeline notes.':!c.timelineTotal&&older?'Smart mode is active, but no eligible summaries were found for the '+older+' older scenes. Open Story memory to check archived-source notes or generate the missing timeline.':'Smart mode prioritizes older timeline summaries before additional recent full replies.';
+ $('previewModeHelp').textContent=mode==='recent'?(available?'Recent-only mode is excluding '+available+' saved timeline entries. Switch to Smart to include eligible older summaries.':'Recent-only mode excludes older timelines. Switch to Smart, then use Story memory → Update memory if the summaries are missing.'):mode==='full'?'Full mode sends the original active story instead of separate timeline notes.':!c.timelineTotal&&older?'Smart mode is active, but no eligible summaries were found for the '+older+' older scenes. Open Story memory to check archived-source notes or generate the missing timeline.':'Smart mode prioritizes older timeline summaries before additional recent full replies.';
  $('previewSwitchSmart').hidden=mode!=='recent';
  $('previewMemoryRepair').hidden=mode!=='smart'||!(c.missingEvents||c.diagnostics.archived||c.diagnostics.staged);
  $('previewText').textContent=c.messages.map(m=>'['+m.role.toUpperCase()+']\n'+m.content).join('\n\n');
@@ -968,9 +968,9 @@ function preview(){
 $('previewSwitchSmart').onclick=async()=>{
  const s=active();if(!s||busy||s.mode!=='recent')return;
  s.mode='smart';s.updated=now();
- try{await save()}catch{} // The persistent storage warning handles a failed save.
+ let persisted=true;try{await save()}catch{persisted=false} // The persistent storage warning handles a failed save.
  updateContext();preview();
- status('Smart context selected. Review the timeline count in Next request.');
+ status(persisted?'Smart context selected. Review the timeline count in Next request.':'Smart context selected for this session, but the local save failed. Back up before closing.',!persisted);
 };
 $('previewMemoryRepair').onclick=()=>{$('preview').close();openArchive('memory')};
 function getContent(m){if(typeof m.content==='string')return m.content;if(typeof m.text==='string')return m.text;let parts=Array.isArray(m.content)?m.content:Array.isArray(m.contentParts)?m.contentParts:Array.isArray(m.parts)?m.parts:[];return parts.map(p=>typeof p==='string'?p:(p.type==='text'||!p.type)?(p.text||p.content||''):'').filter(x=>typeof x==='string').join('\n')}
